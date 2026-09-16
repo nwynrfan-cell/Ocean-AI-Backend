@@ -1,147 +1,100 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
-from typing import Optional
-import sqlite3
 import os
+import sqlite3
 import secrets
+import hashlib
+from datetime import datetime, timezone
+from typing import Optional
 
-# =========================
-# تنظیمات
-# =========================
+import requests
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+
+# =========================================================
+# Ocean AI
+# Professional FastAPI Backend
+# =========================================================
+
+APP_NAME = "Ocean AI"
+APP_VERSION = "1.0.0"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB = os.path.join(BASE_DIR, "income_app.db")
+DB_PATH = os.path.join(BASE_DIR, "ocean_ai.db")
+
+# ---------------------------------------------------------
+# AI Provider Settings
+# این موارد را در Railway → Variables قرار بده
+# ---------------------------------------------------------
+
+AI_API_KEY = os.getenv("AI_API_KEY", "")
+AI_API_URL = os.getenv(
+    "AI_API_URL",
+    "https://api.openai.com/v1/chat/completions"
+)
+AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
+
+# ---------------------------------------------------------
+# FastAPI
+# ---------------------------------------------------------
 
 app = FastAPI(
-    title="Daramadza API",
-    version="1.0.0"
+    title=APP_NAME,
+    version=APP_VERSION,
+    description="Ocean AI professional artificial intelligence API"
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =========================
-# Database
-# =========================
 
-def db():
-    conn = sqlite3.connect(DB)
+# =========================================================
+# Database
+# =========================================================
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db():
-    conn = db()
+    conn = get_db()
+    cur = conn.cursor()
 
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS users(
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        phone TEXT DEFAULT '',
-        balance INTEGER DEFAULT 0,
-        invites INTEGER DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS tasks(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        description TEXT DEFAULT '',
-        link TEXT DEFAULT '',
-        reward INTEGER DEFAULT 0,
-        icon TEXT DEFAULT '🎯',
-        active INTEGER DEFAULT 1
-    );
-
-    CREATE TABLE IF NOT EXISTS completed(
-        user_id TEXT,
-        task_id INTEGER,
-        UNIQUE(user_id, task_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS withdrawals(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT,
-        amount INTEGER,
-        status TEXT DEFAULT 'pending'
-    );
-
-    CREATE TABLE IF NOT EXISTS support(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT,
-        subject TEXT,
-        message TEXT,
-        reply TEXT DEFAULT '',
-        status TEXT DEFAULT 'pending'
-    );
-
-    CREATE TABLE IF NOT EXISTS notices(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT,
-        body TEXT,
-        active INTEGER DEFAULT 1
-    );
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
     """)
 
-    # مأموریت‌های اولیه
-    task_count = conn.execute(
-        "SELECT COUNT(*) FROM tasks"
-    ).fetchone()[0]
-
-    if task_count == 0:
-        conn.executemany(
-            """
-            INSERT INTO tasks
-            (title, description, link, reward, icon)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    "عضویت در کانال",
-                    "وارد لینک شوید و مأموریت را طبق توضیحات انجام دهید.",
-                    "https://example.com/channel",
-                    5000,
-                    "📢"
-                ),
-                (
-                    "ثبت نظر",
-                    "صفحه معرفی‌شده را مشاهده و نظر واقعی خود را ثبت کنید.",
-                    "https://example.com/page",
-                    8000,
-                    "⭐"
-                ),
-                (
-                    "نظرسنجی کوتاه",
-                    "به چند سؤال نظرسنجی پاسخ دهید.",
-                    "https://example.com/survey",
-                    10000,
-                    "📝"
-                )
-            ]
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            token_hash TEXT UNIQUE NOT NULL,
+            created_at TEXT NOT NULL,
+            last_used TEXT NOT NULL
         )
+    """)
 
-    # اطلاعیه اولیه
-    notice_count = conn.execute(
-        "SELECT COUNT(*) FROM notices"
-    ).fetchone()[0]
-
-    if notice_count == 0:
-        conn.execute(
-            """
-            INSERT INTO notices(title, body)
-            VALUES (?, ?)
-            """,
-            (
-                "به درآمدزا خوش آمدید",
-                "مأموریت‌های جدید به‌صورت دوره‌ای در برنامه قرار می‌گیرند."
-            )
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
         )
+    """)
 
     conn.commit()
     conn.close()
@@ -149,636 +102,692 @@ def init_db():
 
 init_db()
 
-# =========================
+
+# =========================================================
+# Helpers
+# =========================================================
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def create_token():
+    return secrets.token_urlsafe(48)
+
+
+def save_message(user_id: str, role: str, content: str):
+    conn = get_db()
+
+    conn.execute(
+        """
+        INSERT INTO messages
+        (user_id, role, content, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (user_id, role, content, now_iso())
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def authenticate(authorization: Optional[str]):
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Authorization header is required"
+        )
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid authorization format"
+        )
+
+    token = authorization.replace("Bearer ", "", 1).strip()
+
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid token"
+        )
+
+    token_hash = hash_text(token)
+
+    conn = get_db()
+
+    user = conn.execute(
+        """
+        SELECT user_id
+        FROM sessions
+        WHERE token_hash = ?
+        """,
+        (token_hash,)
+    ).fetchone()
+
+    if not user:
+        conn.close()
+        raise HTTPException(
+            status_code=401,
+            detail="Session expired or invalid"
+        )
+
+    conn.execute(
+        """
+        UPDATE sessions
+        SET last_used = ?
+        WHERE token_hash = ?
+        """,
+        (now_iso(), token_hash)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return user["user_id"]
+
+
+# =========================================================
 # Models
-# =========================
+# =========================================================
 
-class User(BaseModel):
-    id: Optional[str] = None
-    name: str = "کاربر"
-    phone: str = ""
-    balance: int = 0
-    invites: int = 0
-
-
-class Task(BaseModel):
-    title: str
-    description: str = ""
-    link: str = ""
-    reward: int = 0
-    icon: str = "🎯"
-
-
-class Withdrawal(BaseModel):
+class RegisterRequest(BaseModel):
     user_id: str
-    amount: int
+    password: str
 
 
-class Support(BaseModel):
+class LoginRequest(BaseModel):
     user_id: str
-    subject: str = "پشتیبانی"
+    password: str
+
+
+class ChatRequest(BaseModel):
     message: str
 
 
-class Notice(BaseModel):
-    title: str
-    body: str
-
-
-class CompleteTask(BaseModel):
-    user_id: str
-
-
-# =========================
+# =========================================================
 # Root
-# =========================
+# =========================================================
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 def root():
-    index_path = os.path.join(BASE_DIR, "index.html")
-
-    if os.path.exists(index_path):
-        with open(index_path, "r", encoding="utf-8") as f:
-            return f.read()
-
-    return """
-    <html lang="fa" dir="rtl">
-    <head>
-        <meta charset="UTF-8">
-        <title>درآمدزا</title>
-    </head>
-    <body>
-        <h2>سرور درآمدزا فعال است</h2>
-        <p>برای نمایش برنامه، فایل index.html را کنار main.py قرار دهید.</p>
-        <p>API فعال است.</p>
-    </body>
-    </html>
-    """
+    return {
+        "success": True,
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "status": "online",
+        "message": "Ocean AI Server Online"
+    }
 
 
-# =========================
+# =========================================================
 # Health
-# =========================
+# =========================================================
 
 @app.get("/api/health")
 def health():
     return {
-        "ok": True,
-        "status": "online",
-        "service": "Daramadza API"
+        "success": True,
+        "status": "healthy",
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "ai_configured": bool(AI_API_KEY)
     }
 
 
-# =========================
-# Users
-# =========================
+# =========================================================
+# Register
+# =========================================================
 
-@app.post("/api/users")
-def save_user(u: User):
+@app.post("/api/auth/register")
+def register(data: RegisterRequest):
 
-    uid = u.id or secrets.token_hex(8)
+    user_id = data.user_id.strip()
+    password = data.password
 
-    conn = db()
-
-    old = conn.execute(
-        "SELECT * FROM users WHERE id=?",
-        (uid,)
-    ).fetchone()
-
-    if old:
-        conn.execute(
-            """
-            UPDATE users
-            SET name=?, phone=?
-            WHERE id=?
-            """,
-            (u.name, u.phone, uid)
-        )
-    else:
-        conn.execute(
-            """
-            INSERT INTO users
-            (id, name, phone, balance, invites)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                uid,
-                u.name,
-                u.phone,
-                0,
-                0
-            )
+    if len(user_id) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail="User ID must contain at least 3 characters"
         )
 
-    conn.commit()
+    if len(password) < 6:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must contain at least 6 characters"
+        )
 
-    row = conn.execute(
-        "SELECT * FROM users WHERE id=?",
-        (uid,)
-    ).fetchone()
+    password_hash = hash_text(password)
 
-    conn.close()
+    conn = get_db()
 
-    return dict(row)
-
-
-@app.get("/api/users")
-def users():
-
-    conn = db()
-
-    rows = conn.execute(
+    existing = conn.execute(
         """
-        SELECT *
+        SELECT id
         FROM users
-        ORDER BY rowid DESC
-        """
-    ).fetchall()
-
-    conn.close()
-
-    return {
-        "users": [dict(row) for row in rows]
-    }
-
-
-@app.get("/api/users/{user_id}")
-def get_user(user_id: str):
-
-    conn = db()
-
-    row = conn.execute(
-        "SELECT * FROM users WHERE id=?",
+        WHERE user_id = ?
+        """,
         (user_id,)
     ).fetchone()
 
-    conn.close()
-
-    if not row:
-        raise HTTPException(
-            status_code=404,
-            detail="کاربر پیدا نشد"
-        )
-
-    return dict(row)
-
-
-# =========================
-# Tasks
-# =========================
-
-@app.get("/api/tasks")
-def get_tasks():
-
-    conn = db()
-
-    rows = conn.execute(
-        """
-        SELECT *
-        FROM tasks
-        WHERE active=1
-        ORDER BY id DESC
-        """
-    ).fetchall()
-
-    conn.close()
-
-    return {
-        "tasks": [dict(row) for row in rows]
-    }
-
-
-@app.post("/api/tasks")
-def add_task(task: Task):
-
-    if task.reward < 0:
-        raise HTTPException(
-            status_code=400,
-            detail="پاداش نمی‌تواند منفی باشد"
-        )
-
-    conn = db()
-
-    cursor = conn.execute(
-        """
-        INSERT INTO tasks
-        (title, description, link, reward, icon)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            task.title,
-            task.description,
-            task.link,
-            task.reward,
-            task.icon
-        )
-    )
-
-    conn.commit()
-
-    row = conn.execute(
-        "SELECT * FROM tasks WHERE id=?",
-        (cursor.lastrowid,)
-    ).fetchone()
-
-    conn.close()
-
-    return dict(row)
-
-
-@app.delete("/api/tasks/{task_id}")
-def delete_task(task_id: int):
-
-    conn = db()
-
-    cursor = conn.execute(
-        """
-        UPDATE tasks
-        SET active=0
-        WHERE id=?
-        """,
-        (task_id,)
-    )
-
-    conn.commit()
-    conn.close()
-
-    if cursor.rowcount == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="مأموریت پیدا نشد"
-        )
-
-    return {
-        "ok": True
-    }
-
-
-# =========================
-# Complete Task
-# =========================
-
-@app.post("/api/tasks/{task_id}/complete")
-def complete_task(
-    task_id: int,
-    data: CompleteTask
-):
-
-    user_id = data.user_id
-
-    conn = db()
-
-    user = conn.execute(
-        "SELECT * FROM users WHERE id=?",
-        (user_id,)
-    ).fetchone()
-
-    if not user:
+    if existing:
         conn.close()
         raise HTTPException(
-            status_code=404,
-            detail="کاربر پیدا نشد"
-        )
-
-    task = conn.execute(
-        """
-        SELECT *
-        FROM tasks
-        WHERE id=? AND active=1
-        """,
-        (task_id,)
-    ).fetchone()
-
-    if not task:
-        conn.close()
-        raise HTTPException(
-            status_code=404,
-            detail="مأموریت پیدا نشد"
-        )
-
-    already = conn.execute(
-        """
-        SELECT 1
-        FROM completed
-        WHERE user_id=? AND task_id=?
-        """,
-        (user_id, task_id)
-    ).fetchone()
-
-    if already:
-        conn.close()
-        raise HTTPException(
-            status_code=400,
-            detail="این مأموریت قبلاً انجام شده است"
+            status_code=409,
+            detail="User already exists"
         )
 
     conn.execute(
         """
-        INSERT INTO completed(user_id, task_id)
-        VALUES (?, ?)
-        """,
-        (user_id, task_id)
-    )
-
-    conn.execute(
-        """
-        UPDATE users
-        SET balance=balance+?
-        WHERE id=?
-        """,
-        (task["reward"], user_id)
-    )
-
-    conn.commit()
-
-    balance = conn.execute(
-        "SELECT balance FROM users WHERE id=?",
-        (user_id,)
-    ).fetchone()["balance"]
-
-    conn.close()
-
-    return {
-        "ok": True,
-        "reward": task["reward"],
-        "balance": balance
-    }
-
-
-# =========================
-# Withdrawals
-# =========================
-
-@app.post("/api/withdrawals")
-def create_withdrawal(w: Withdrawal):
-
-    if w.amount <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="مبلغ نامعتبر"
-        )
-
-    conn = db()
-
-    user = conn.execute(
-        "SELECT balance FROM users WHERE id=?",
-        (w.user_id,)
-    ).fetchone()
-
-    if not user:
-        conn.close()
-        raise HTTPException(
-            status_code=404,
-            detail="کاربر پیدا نشد"
-        )
-
-    if w.amount > user["balance"]:
-        conn.close()
-        raise HTTPException(
-            status_code=400,
-            detail="موجودی کافی نیست"
-        )
-
-    conn.execute(
-        """
-        UPDATE users
-        SET balance=balance-?
-        WHERE id=?
-        """,
-        (w.amount, w.user_id)
-    )
-
-    cursor = conn.execute(
-        """
-        INSERT INTO withdrawals(user_id, amount)
-        VALUES (?, ?)
-        """,
-        (w.user_id, w.amount)
-    )
-
-    conn.commit()
-
-    balance = conn.execute(
-        "SELECT balance FROM users WHERE id=?",
-        (w.user_id,)
-    ).fetchone()["balance"]
-
-    conn.close()
-
-    return {
-        "ok": True,
-        "withdrawal_id": cursor.lastrowid,
-        "balance": balance
-    }
-
-
-@app.get("/api/withdrawals")
-def get_withdrawals():
-
-    conn = db()
-
-    rows = conn.execute(
-        """
-        SELECT *
-        FROM withdrawals
-        ORDER BY id DESC
-        """
-    ).fetchall()
-
-    conn.close()
-
-    return {
-        "withdrawals": [dict(row) for row in rows]
-    }
-
-
-# =========================
-# Support
-# =========================
-
-@app.post("/api/support")
-def create_support(s: Support):
-
-    if not s.message.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="پیام خالی است"
-        )
-
-    conn = db()
-
-    cursor = conn.execute(
-        """
-        INSERT INTO support
-        (user_id, subject, message)
+        INSERT INTO users
+        (user_id, password_hash, created_at)
         VALUES (?, ?, ?)
         """,
+        (user_id, password_hash, now_iso())
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "message": "Registration successful",
+        "user_id": user_id
+    }
+
+
+# =========================================================
+# Login
+# =========================================================
+
+@app.post("/api/auth/login")
+def login(data: LoginRequest):
+
+    user_id = data.user_id.strip()
+    password_hash = hash_text(data.password)
+
+    conn = get_db()
+
+    user = conn.execute(
+        """
+        SELECT user_id
+        FROM users
+        WHERE user_id = ?
+        AND password_hash = ?
+        """,
+        (user_id, password_hash)
+    ).fetchone()
+
+    if not user:
+        conn.close()
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid user ID or password"
+        )
+
+    token = create_token()
+    token_hash = hash_text(token)
+
+    conn.execute(
+        """
+        INSERT INTO sessions
+        (user_id, token_hash, created_at, last_used)
+        VALUES (?, ?, ?, ?)
+        """,
         (
-            s.user_id,
-            s.subject,
-            s.message
+            user_id,
+            token_hash,
+            now_iso(),
+            now_iso()
         )
     )
 
     conn.commit()
+    conn.close()
 
-    row = conn.execute(
+    return {
+        "success": True,
+        "message": "Login successful",
+        "user_id": user_id,
+        "token": token
+    }
+
+
+# =========================================================
+# Current User
+# =========================================================
+
+@app.get("/api/auth/me")
+def me(
+    authorization: Optional[str] = Header(default=None)
+):
+
+    user_id = authenticate(authorization)
+
+    conn = get_db()
+
+    user = conn.execute(
         """
-        SELECT *
-        FROM support
-        WHERE id=?
+        SELECT user_id, created_at
+        FROM users
+        WHERE user_id = ?
         """,
-        (cursor.lastrowid,)
+        (user_id,)
     ).fetchone()
 
     conn.close()
 
-    return dict(row)
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+
+    return {
+        "success": True,
+        "user": {
+            "user_id": user["user_id"],
+            "created_at": user["created_at"]
+        }
+    }
 
 
-@app.get("/api/support/{user_id}")
-def get_user_support(user_id: str):
+# =========================================================
+# Logout
+# =========================================================
 
-    conn = db()
+@app.post("/api/auth/logout")
+def logout(
+    authorization: Optional[str] = Header(default=None)
+):
+
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Authorization required"
+        )
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid authorization"
+        )
+
+    token = authorization.replace("Bearer ", "", 1).strip()
+    token_hash = hash_text(token)
+
+    conn = get_db()
+
+    conn.execute(
+        """
+        DELETE FROM sessions
+        WHERE token_hash = ?
+        """,
+        (token_hash,)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "message": "Logout successful"
+    }
+
+
+# =========================================================
+# Get Chat History
+# =========================================================
+
+@app.get("/api/chat/history")
+def chat_history(
+    authorization: Optional[str] = Header(default=None)
+):
+
+    user_id = authenticate(authorization)
+
+    conn = get_db()
 
     rows = conn.execute(
         """
-        SELECT *
-        FROM support
-        WHERE user_id=?
-        ORDER BY id DESC
+        SELECT role, content, created_at
+        FROM messages
+        WHERE user_id = ?
+        ORDER BY id ASC
         """,
         (user_id,)
     ).fetchall()
 
     conn.close()
 
+    messages = []
+
+    for row in rows:
+        messages.append({
+            "role": row["role"],
+            "content": row["content"],
+            "created_at": row["created_at"]
+        })
+
     return {
-        "messages": [dict(row) for row in rows]
+        "success": True,
+        "count": len(messages),
+        "messages": messages
     }
 
 
-@app.get("/api/support")
-def get_all_support():
+# =========================================================
+# Delete Chat History
+# =========================================================
 
-    conn = db()
+@app.delete("/api/chat/history")
+def delete_chat_history(
+    authorization: Optional[str] = Header(default=None)
+):
 
-    rows = conn.execute(
+    user_id = authenticate(authorization)
+
+    conn = get_db()
+
+    conn.execute(
         """
-        SELECT *
-        FROM support
-        ORDER BY id DESC
-        """
-    ).fetchall()
-
-    conn.close()
-
-    return {
-        "messages": [dict(row) for row in rows]
-    }
-
-
-# =========================
-# Notices
-# =========================
-
-@app.post("/api/notices")
-def add_notice(notice: Notice):
-
-    conn = db()
-
-    cursor = conn.execute(
-        """
-        INSERT INTO notices(title, body)
-        VALUES (?, ?)
+        DELETE FROM messages
+        WHERE user_id = ?
         """,
-        (
-            notice.title,
-            notice.body
-        )
+        (user_id,)
     )
 
     conn.commit()
-
-    row = conn.execute(
-        """
-        SELECT *
-        FROM notices
-        WHERE id=?
-        """,
-        (cursor.lastrowid,)
-    ).fetchone()
-
     conn.close()
 
-    return dict(row)
+    return {
+        "success": True,
+        "message": "Chat history deleted"
+    }
 
 
-@app.get("/api/notices")
-def get_notices():
+# =========================================================
+# AI Request
+# =========================================================
 
-    conn = db()
+def ask_ai(message: str, history: list):
+
+    if not AI_API_KEY:
+        return (
+            "کلید API هوش مصنوعی هنوز روی سرور تنظیم نشده است. "
+            "در Railway از بخش Variables مقدار AI_API_KEY را تنظیم کنید."
+        )
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are Ocean AI, a helpful and professional AI assistant. "
+                "Answer clearly and accurately. "
+                "If the user writes Persian, answer in Persian."
+            )
+        }
+    ]
+
+    for item in history:
+        messages.append({
+            "role": item["role"],
+            "content": item["content"]
+        })
+
+    messages.append({
+        "role": "user",
+        "content": message
+    })
+
+    headers = {
+        "Authorization": f"Bearer {AI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": AI_MODEL,
+        "messages": messages,
+        "temperature": 0.7
+    }
+
+    try:
+
+        response = requests.post(
+            AI_API_URL,
+            headers=headers,
+            json=payload,
+            timeout=90
+        )
+
+    except requests.RequestException as e:
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"AI provider connection failed: {str(e)}"
+        )
+
+    if response.status_code >= 400:
+
+        try:
+            error_data = response.json()
+        except Exception:
+            error_data = response.text
+
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "AI provider returned an error",
+                "provider_response": error_data
+            }
+        )
+
+    try:
+        data = response.json()
+    except Exception:
+
+        raise HTTPException(
+            status_code=502,
+            detail="Invalid response from AI provider"
+        )
+
+    try:
+        answer = data["choices"][0]["message"]["content"]
+    except Exception:
+
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Could not read AI response",
+                "response": data
+            }
+        )
+
+    return answer
+
+
+# =========================================================
+# Chat
+# =========================================================
+
+@app.post("/api/chat")
+def chat(
+    data: ChatRequest,
+    authorization: Optional[str] = Header(default=None)
+):
+
+    user_id = authenticate(authorization)
+
+    message = data.message.strip()
+
+    if not message:
+        raise HTTPException(
+            status_code=400,
+            detail="Message cannot be empty"
+        )
+
+    if len(message) > 10000:
+        raise HTTPException(
+            status_code=400,
+            detail="Message is too long"
+        )
+
+    conn = get_db()
 
     rows = conn.execute(
         """
-        SELECT *
-        FROM notices
-        WHERE active=1
+        SELECT role, content
+        FROM messages
+        WHERE user_id = ?
         ORDER BY id DESC
-        """
+        LIMIT 20
+        """,
+        (user_id,)
     ).fetchall()
 
     conn.close()
 
+    history = []
+
+    for row in reversed(rows):
+        history.append({
+            "role": row["role"],
+            "content": row["content"]
+        })
+
+    save_message(
+        user_id,
+        "user",
+        message
+    )
+
+    try:
+
+        answer = ask_ai(
+            message,
+            history
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"AI error: {str(e)}"
+        )
+
+    save_message(
+        user_id,
+        "assistant",
+        answer
+    )
+
     return {
-        "notices": [dict(row) for row in rows]
+        "success": True,
+        "user_id": user_id,
+        "answer": answer,
+        "model": AI_MODEL,
+        "created_at": now_iso()
     }
 
 
-# =========================
-# Admin Summary
-# =========================
+# =========================================================
+# Statistics
+# =========================================================
 
-@app.get("/api/admin/summary")
-def admin_summary():
+@app.get("/api/stats")
+def stats(
+    authorization: Optional[str] = Header(default=None)
+):
 
-    conn = db()
+    user_id = authenticate(authorization)
 
-    result = {
-        "users": conn.execute(
-            "SELECT COUNT(*) FROM users"
-        ).fetchone()[0],
+    conn = get_db()
 
-        "tasks": conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE active=1"
-        ).fetchone()[0],
-
-        "withdrawals": conn.execute(
-            "SELECT COUNT(*) FROM withdrawals"
-        ).fetchone()[0],
-
-        "support": conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM support
-            WHERE status='pending'
-            """
-        ).fetchone()[0]
-    }
+    message_count = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM messages
+        WHERE user_id = ?
+        """,
+        (user_id,)
+    ).fetchone()[0]
 
     conn.close()
 
-    return result
+    return {
+        "success": True,
+        "user_id": user_id,
+        "messages": message_count,
+        "ai_configured": bool(AI_API_KEY),
+        "server": APP_NAME
+    }
 
 
-# =========================
-# Railway / Local
-# =========================
+# =========================================================
+# Server Information
+# =========================================================
+
+@app.get("/api/info")
+def info():
+
+    return {
+        "success": True,
+        "name": APP_NAME,
+        "version": APP_VERSION,
+        "backend": "FastAPI",
+        "database": "SQLite",
+        "status": "online",
+        "ai_configured": bool(AI_API_KEY)
+    }
+
+
+# =========================================================
+# Cleanup
+# =========================================================
+
+@app.post("/api/system/cleanup")
+def cleanup():
+
+    conn = get_db()
+
+    # حذف sessionهای قدیمی‌تر از 30 روز
+    conn.execute(
+        """
+        DELETE FROM sessions
+        WHERE created_at < datetime('now', '-30 days')
+        """
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "message": "Cleanup completed"
+    }
+
+
+# =========================================================
+# Railway / Local Start
+# =========================================================
 
 if __name__ == "__main__":
+
     import uvicorn
 
-    port = int(os.environ.get("PORT", "8000"))
+    port = int(
+        os.environ.get(
+            "PORT",
+            "8000"
+        )
+    )
 
     uvicorn.run(
         app,
