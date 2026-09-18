@@ -6,7 +6,9 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import requests
-from fastapi import FastAPI, HTTPException, Header
+
+from fastapi import FastAPI, HTTPException, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -22,27 +24,39 @@ APP_VERSION = "1.0.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "ocean_ai.db")
 
-# ---------------------------------------------------------
+
+# =========================================================
 # AI Provider Settings
-# این موارد را در Railway → Variables قرار بده
-# ---------------------------------------------------------
+# Railway → Variables
+# =========================================================
 
 AI_API_KEY = os.getenv("AI_API_KEY", "")
+
 AI_API_URL = os.getenv(
     "AI_API_URL",
     "https://api.openai.com/v1/chat/completions"
 )
-AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
 
-# ---------------------------------------------------------
+AI_MODEL = os.getenv(
+    "AI_MODEL",
+    "gpt-4o-mini"
+)
+
+
+# =========================================================
 # FastAPI
-# ---------------------------------------------------------
+# =========================================================
 
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
     description="Ocean AI professional artificial intelligence API"
 )
+
+
+# =========================================================
+# CORS
+# =========================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,6 +65,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# =========================================================
+# Swagger Bearer Authentication
+# =========================================================
+
+security = HTTPBearer(auto_error=False)
 
 
 # =========================================================
@@ -64,6 +85,7 @@ def get_db():
 
 
 def init_db():
+
     conn = get_db()
     cur = conn.cursor()
 
@@ -112,14 +134,21 @@ def now_iso():
 
 
 def hash_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        text.encode("utf-8")
+    ).hexdigest()
 
 
 def create_token():
     return secrets.token_urlsafe(48)
 
 
-def save_message(user_id: str, role: str, content: str):
+def save_message(
+    user_id: str,
+    role: str,
+    content: str
+):
+
     conn = get_db()
 
     conn.execute(
@@ -128,29 +157,46 @@ def save_message(user_id: str, role: str, content: str):
         (user_id, role, content, created_at)
         VALUES (?, ?, ?, ?)
         """,
-        (user_id, role, content, now_iso())
+        (
+            user_id,
+            role,
+            content,
+            now_iso()
+        )
     )
 
     conn.commit()
     conn.close()
 
 
-def authenticate(authorization: Optional[str]):
-    if not authorization:
+# =========================================================
+# Authentication
+# =========================================================
+
+def authenticate(
+    credentials: Optional[
+        HTTPAuthorizationCredentials
+    ]
+):
+
+    if not credentials:
+
         raise HTTPException(
             status_code=401,
             detail="Authorization header is required"
         )
 
-    if not authorization.startswith("Bearer "):
+    if credentials.scheme.lower() != "bearer":
+
         raise HTTPException(
             status_code=401,
             detail="Invalid authorization format"
         )
 
-    token = authorization.replace("Bearer ", "", 1).strip()
+    token = credentials.credentials.strip()
 
     if not token:
+
         raise HTTPException(
             status_code=401,
             detail="Invalid token"
@@ -170,7 +216,9 @@ def authenticate(authorization: Optional[str]):
     ).fetchone()
 
     if not user:
+
         conn.close()
+
         raise HTTPException(
             status_code=401,
             detail="Session expired or invalid"
@@ -182,7 +230,10 @@ def authenticate(authorization: Optional[str]):
         SET last_used = ?
         WHERE token_hash = ?
         """,
-        (now_iso(), token_hash)
+        (
+            now_iso(),
+            token_hash
+        )
     )
 
     conn.commit()
@@ -215,6 +266,7 @@ class ChatRequest(BaseModel):
 
 @app.get("/")
 def root():
+
     return {
         "success": True,
         "app": APP_NAME,
@@ -230,6 +282,7 @@ def root():
 
 @app.get("/api/health")
 def health():
+
     return {
         "success": True,
         "status": "healthy",
@@ -244,18 +297,22 @@ def health():
 # =========================================================
 
 @app.post("/api/auth/register")
-def register(data: RegisterRequest):
+def register(
+    data: RegisterRequest
+):
 
     user_id = data.user_id.strip()
     password = data.password
 
     if len(user_id) < 3:
+
         raise HTTPException(
             status_code=400,
             detail="User ID must contain at least 3 characters"
         )
 
     if len(password) < 6:
+
         raise HTTPException(
             status_code=400,
             detail="Password must contain at least 6 characters"
@@ -275,7 +332,9 @@ def register(data: RegisterRequest):
     ).fetchone()
 
     if existing:
+
         conn.close()
+
         raise HTTPException(
             status_code=409,
             detail="User already exists"
@@ -287,7 +346,11 @@ def register(data: RegisterRequest):
         (user_id, password_hash, created_at)
         VALUES (?, ?, ?)
         """,
-        (user_id, password_hash, now_iso())
+        (
+            user_id,
+            password_hash,
+            now_iso()
+        )
     )
 
     conn.commit()
@@ -305,10 +368,15 @@ def register(data: RegisterRequest):
 # =========================================================
 
 @app.post("/api/auth/login")
-def login(data: LoginRequest):
+def login(
+    data: LoginRequest
+):
 
     user_id = data.user_id.strip()
-    password_hash = hash_text(data.password)
+
+    password_hash = hash_text(
+        data.password
+    )
 
     conn = get_db()
 
@@ -319,11 +387,16 @@ def login(data: LoginRequest):
         WHERE user_id = ?
         AND password_hash = ?
         """,
-        (user_id, password_hash)
+        (
+            user_id,
+            password_hash
+        )
     ).fetchone()
 
     if not user:
+
         conn.close()
+
         raise HTTPException(
             status_code=401,
             detail="Invalid user ID or password"
@@ -363,10 +436,12 @@ def login(data: LoginRequest):
 
 @app.get("/api/auth/me")
 def me(
-    authorization: Optional[str] = Header(default=None)
+    credentials: Optional[
+        HTTPAuthorizationCredentials
+    ] = Security(security)
 ):
 
-    user_id = authenticate(authorization)
+    user_id = authenticate(credentials)
 
     conn = get_db()
 
@@ -382,6 +457,7 @@ def me(
     conn.close()
 
     if not user:
+
         raise HTTPException(
             status_code=404,
             detail="User not found"
@@ -402,22 +478,14 @@ def me(
 
 @app.post("/api/auth/logout")
 def logout(
-    authorization: Optional[str] = Header(default=None)
+    credentials: Optional[
+        HTTPAuthorizationCredentials
+    ] = Security(security)
 ):
 
-    if not authorization:
-        raise HTTPException(
-            status_code=401,
-            detail="Authorization required"
-        )
+    user_id = authenticate(credentials)
 
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid authorization"
-        )
-
-    token = authorization.replace("Bearer ", "", 1).strip()
+    token = credentials.credentials.strip()
     token_hash = hash_text(token)
 
     conn = get_db()
@@ -435,6 +503,7 @@ def logout(
 
     return {
         "success": True,
+        "user_id": user_id,
         "message": "Logout successful"
     }
 
@@ -445,10 +514,12 @@ def logout(
 
 @app.get("/api/chat/history")
 def chat_history(
-    authorization: Optional[str] = Header(default=None)
+    credentials: Optional[
+        HTTPAuthorizationCredentials
+    ] = Security(security)
 ):
 
-    user_id = authenticate(authorization)
+    user_id = authenticate(credentials)
 
     conn = get_db()
 
@@ -467,6 +538,7 @@ def chat_history(
     messages = []
 
     for row in rows:
+
         messages.append({
             "role": row["role"],
             "content": row["content"],
@@ -486,10 +558,12 @@ def chat_history(
 
 @app.delete("/api/chat/history")
 def delete_chat_history(
-    authorization: Optional[str] = Header(default=None)
+    credentials: Optional[
+        HTTPAuthorizationCredentials
+    ] = Security(security)
 ):
 
-    user_id = authenticate(authorization)
+    user_id = authenticate(credentials)
 
     conn = get_db()
 
@@ -514,26 +588,35 @@ def delete_chat_history(
 # AI Request
 # =========================================================
 
-def ask_ai(message: str, history: list):
+def ask_ai(
+    message: str,
+    history: list
+):
 
     if not AI_API_KEY:
+
         return (
-            "کلید API هوش مصنوعی هنوز روی سرور تنظیم نشده است. "
-            "در Railway از بخش Variables مقدار AI_API_KEY را تنظیم کنید."
+            "کلید API هوش مصنوعی هنوز روی سرور "
+            "تنظیم نشده است. "
+            "در Railway از بخش Variables مقدار "
+            "AI_API_KEY را تنظیم کنید."
         )
 
     messages = [
         {
             "role": "system",
             "content": (
-                "You are Ocean AI, a helpful and professional AI assistant. "
+                "You are Ocean AI, a helpful and "
+                "professional AI assistant. "
                 "Answer clearly and accurately. "
-                "If the user writes Persian, answer in Persian."
+                "If the user writes Persian, "
+                "answer in Persian."
             )
         }
     ]
 
     for item in history:
+
         messages.append({
             "role": item["role"],
             "content": item["content"]
@@ -568,7 +651,10 @@ def ask_ai(message: str, history: list):
 
         raise HTTPException(
             status_code=502,
-            detail=f"AI provider connection failed: {str(e)}"
+            detail=(
+                "AI provider connection failed: "
+                f"{str(e)}"
+            )
         )
 
     if response.status_code >= 400:
@@ -587,7 +673,9 @@ def ask_ai(message: str, history: list):
         )
 
     try:
+
         data = response.json()
+
     except Exception:
 
         raise HTTPException(
@@ -596,7 +684,15 @@ def ask_ai(message: str, history: list):
         )
 
     try:
-        answer = data["choices"][0]["message"]["content"]
+
+        answer = data[
+            "choices"
+        ][0][
+            "message"
+        ][
+            "content"
+        ]
+
     except Exception:
 
         raise HTTPException(
@@ -617,20 +713,24 @@ def ask_ai(message: str, history: list):
 @app.post("/api/chat")
 def chat(
     data: ChatRequest,
-    authorization: Optional[str] = Header(default=None)
+    credentials: Optional[
+        HTTPAuthorizationCredentials
+    ] = Security(security)
 ):
 
-    user_id = authenticate(authorization)
+    user_id = authenticate(credentials)
 
     message = data.message.strip()
 
     if not message:
+
         raise HTTPException(
             status_code=400,
             detail="Message cannot be empty"
         )
 
     if len(message) > 10000:
+
         raise HTTPException(
             status_code=400,
             detail="Message is too long"
@@ -654,6 +754,7 @@ def chat(
     history = []
 
     for row in reversed(rows):
+
         history.append({
             "role": row["role"],
             "content": row["content"]
@@ -703,10 +804,12 @@ def chat(
 
 @app.get("/api/stats")
 def stats(
-    authorization: Optional[str] = Header(default=None)
+    credentials: Optional[
+        HTTPAuthorizationCredentials
+    ] = Security(security)
 ):
 
-    user_id = authenticate(authorization)
+    user_id = authenticate(credentials)
 
     conn = get_db()
 
@@ -757,11 +860,11 @@ def cleanup():
 
     conn = get_db()
 
-    # حذف sessionهای قدیمی‌تر از 30 روز
     conn.execute(
         """
         DELETE FROM sessions
-        WHERE created_at < datetime('now', '-30 days')
+        WHERE created_at <
+        datetime('now', '-30 days')
         """
     )
 
